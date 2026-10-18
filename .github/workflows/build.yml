@@ -1,0 +1,46 @@
+name: Build AUR Package (CM5 aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkg_name:
+        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, ffmpeg-v4l2-request-git)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/manjaro-arm/rootfs:base
+      options: --privileged
+
+    steps:
+      - name: 1. Підготовка системи та компіляторів (під Cortex-A76)
+        run: |
+          pacman-mirrors -f 5
+          pacman -Syu --noconfirm base-devel git sudo
+          
+          useradd -m -G wheel builder
+          echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          
+          sed -i 's/^CFLAGS=.*/CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"/' /etc/makepkg.conf
+          sed -i 's/^CXXFLAGS=.*/CXXFLAGS="$CFLAGS"/' /etc/makepkg.conf
+          sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+
+      - name: 2. Завантаження та компіляція пакета з AUR
+        run: |
+          su - builder -c "
+            git clone https://aur.archlinux.org/${{ inputs.pkg_name }}.git /tmp/pkg
+            cd /tmp/pkg
+            makepkg -sA --noconfirm --nocheck
+          "
+          mkdir -p ${{ github.workspace }}/out
+          cp /tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
+
+      - name: 3. Збереження готового бінарника
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.pkg_name }}-cm5-aarch64
+          path: ${{ github.workspace }}/out/*.pkg.tar.*
+          if-no-files-found: error
