@@ -12,21 +12,23 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     container:
-      image: ghcr.io/manjaro-arm/rootfs:base
+      image: docker.io/manjaroarm/base:latest
       options: --privileged
 
     steps:
       - name: 1. Підготовка системи та компіляторів (під Cortex-A76)
         run: |
           pacman-mirrors -f 5
-          pacman -Syu --noconfirm base-devel git sudo
+          pacman -Syu --noconfirm base-devel git opendoas
           
           useradd -m -G wheel builder
-          echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          echo "permit nopass :wheel" > /etc/doas.conf
+          chmod -c 0400 /etc/doas.conf
           
           sed -i 's/^CFLAGS=.*/CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"/' /etc/makepkg.conf
           sed -i 's/^CXXFLAGS=.*/CXXFLAGS="$CFLAGS"/' /etc/makepkg.conf
           sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+          echo 'PACMAN_AUTH=(doas)' >> /etc/makepkg.conf
 
       - name: 2. Завантаження та компіляція пакета з AUR
         run: |
