@@ -11,34 +11,45 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    container:
-      image: docker.io/manjaroarm/base:latest
-      options: --privileged
 
     steps:
-      - name: 1. Підготовка системи та компіляторів (під Cortex-A76)
+      - name: 1. Завантаження офіційної Manjaro ARM (rootfs) та підготовка під CM5
         run: |
+          sudo mkdir -p /mnt/manjaro
+          curl -L -s "https://github.com/manjaro-arm/rootfs/releases/download/latest/Manjaro-ARM-aarch64-latest.tar.gz" | sudo tar -xz -C /mnt/manjaro
+          
+          # Монтуємо системні шини для роботи всередині системи (chroot)
+          sudo mount --bind /proc /mnt/manjaro/proc
+          sudo mount --bind /sys /mnt/manjaro/sys
+          sudo mount --bind /dev /mnt/manjaro/dev
+          sudo mount --bind /dev/pts /mnt/manjaro/dev/pts
+          sudo cp -L /etc/resolv.conf /mnt/manjaro/etc/resolv.conf
+
+          # Ініціалізуємо ключі, оновлюємо бази та налаштовуємо компілятор під Cortex-A76
+          sudo chroot /mnt/manjaro /bin/bash -e << 'CHROOT_EOF'
           pacman-mirrors -f 5
-          pacman -Syu --noconfirm base-devel git opendoas
+          pacman-key --init
+          pacman-key --populate archlinuxarm manjaro manjaro-arm
+          pacman -Syu --noconfirm base-devel git sudo
           
           useradd -m -G wheel builder
-          echo "permit nopass :wheel" > /etc/doas.conf
-          chmod -c 0400 /etc/doas.conf
+          echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           
           sed -i 's/^CFLAGS=.*/CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"/' /etc/makepkg.conf
           sed -i 's/^CXXFLAGS=.*/CXXFLAGS="$CFLAGS"/' /etc/makepkg.conf
           sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
-          echo 'PACMAN_AUTH=(doas)' >> /etc/makepkg.conf
+          CHROOT_EOF
 
       - name: 2. Завантаження та компіляція пакета з AUR
         run: |
-          su - builder -c "
+          sudo chroot /mnt/manjaro su - builder -c "
             git clone https://aur.archlinux.org/${{ inputs.pkg_name }}.git /tmp/pkg
             cd /tmp/pkg
             makepkg -sA --noconfirm --nocheck
           "
           mkdir -p ${{ github.workspace }}/out
-          cp /tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
+          sudo cp /mnt/manjaro/tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
+          sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}/out/
 
       - name: 3. Збереження готового бінарника
         uses: actions/upload-artifact@v4
