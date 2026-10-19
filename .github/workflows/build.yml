@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pkg_name:
-        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, ffmpeg-v4l2-request-git)'
+        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, keyd)'
         required: true
         type: string
 
@@ -13,42 +13,79 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: 1. Завантаження офіційної Manjaro ARM (rootfs) та підготовка під CM5
+      - name: 1. Завантаження Arch Linux ARM та підготовка chroot
         run: |
-          sudo mkdir -p /mnt/manjaro
-          curl -L -s "https://github.com/manjaro-arm/rootfs/releases/download/latest/Manjaro-ARM-aarch64-latest.tar.gz" | sudo tar -xz -C /mnt/manjaro
-          
-          # Монтуємо системні шини для роботи всередині системи (chroot)
-          sudo mount --bind /proc /mnt/manjaro/proc
-          sudo mount --bind /sys /mnt/manjaro/sys
-          sudo mount --bind /dev /mnt/manjaro/dev
-          sudo mount --bind /dev/pts /mnt/manjaro/dev/pts
-          sudo cp -L /etc/resolv.conf /mnt/manjaro/etc/resolv.conf
+          set -euxo pipefail
 
-          # Ініціалізуємо ключі, оновлюємо бази та налаштовуємо компілятор під Cortex-A76
-          sudo chroot /mnt/manjaro /bin/bash -e << 'CHROOT_EOF'
-          pacman-mirrors -f 5
-          pacman-key --init
-          pacman-key --populate archlinuxarm manjaro manjaro-arm
-          pacman -Syu --noconfirm base-devel git sudo
-          
-          useradd -m -G wheel builder
-          echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          
-          sed -i 's/^CFLAGS=.*/CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"/' /etc/makepkg.conf
-          sed -i 's/^CXXFLAGS=.*/CXXFLAGS="$CFLAGS"/' /etc/makepkg.conf
-          sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools curl
+
+          sudo mkdir -p /mnt/alarm
+          curl -fL --retry 3 "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz" -o /tmp/rootfs.tar.gz
+          sudo bsdtar -xpf /tmp/rootfs.tar.gz -C /mnt/alarm
+          rm -f /tmp/rootfs.tar.gz
+
+          sudo mount --bind /mnt/alarm /mnt/alarm
+          sudo mount --bind /proc /mnt/alarm/proc
+          sudo mount --bind /sys /mnt/alarm/sys
+          sudo mount --bind /dev /mnt/alarm/dev
+          sudo mount --bind /dev/pts /mnt/alarm/dev/pts
+          sudo rm -f /mnt/alarm/etc/resolv.conf
+          sudo cp -L /etc/resolv.conf /mnt/alarm/etc/resolv.conf
+
+          sudo chroot /mnt/alarm /bin/bash -ex << 'CHROOT_EOF'
+          # 1. Вимикаємо CheckSpace та перевірку підписів для роботи в chroot
+          sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+
+          # 2. Оновлюємо систему та ставимо компілятори
+          pacman -Syu --noconfirm --overwrite '*' ca-certificates archlinuxarm-keyring base-devel git sudo
+
+          # 3. Створюємо користувача builder і налаштовуємо sudo без вимоги TTY
+          id -u builder &>/dev/null || useradd -m -G wheel builder
+          echo "Defaults !requiretty" > /etc/sudoers.d/builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/builder
+          chmod 0440 /etc/sudoers.d/builder
+
+          # 4. Прописуємо оптимізації під CM5 (Cortex-A76) і вимикаємо -debug пакети
+          CORES=$(nproc)
+          cat << MAKEPKG_EOF >> /etc/makepkg.conf
+          CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"
+          CXXFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"
+          MAKEFLAGS="-j${CORES}"
+          OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !debug !lto)
+          MAKEPKG_EOF
           CHROOT_EOF
 
       - name: 2. Завантаження та компіляція пакета з AUR
         run: |
-          sudo chroot /mnt/manjaro su - builder -c "
-            git clone https://aur.archlinux.org/${{ inputs.pkg_name }}.git /tmp/pkg
+          set -euxo pipefail
+          PKG="${{ inputs.pkg_name }}"
+
+          sudo chroot /mnt/alarm /bin/bash -ex << CHROOT_BUILD
+          rm -rf /tmp/pkg
+          mkdir -p /tmp/pkg
+          chown -R builder:builder /tmp/pkg
+
+          # 1. Клонуємо репозиторій з AUR через setpriv (в обхід PAM)
+          setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
+
+          # 2. Безпечно витягуємо список залежностей через .SRCINFO і ставимо їх напряму від root
+          cd /tmp/pkg
+          DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | tr '\n' ' ')
+          if [ -n "\$DEPS" ]; then
+            pacman -S --needed --noconfirm \$DEPS || true
+          fi
+
+          # 3. Компілюємо пакет від імені builder
+          setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
             cd /tmp/pkg
-            makepkg -sA --noconfirm --nocheck
-          "
+            makepkg -sA --noconfirm --nocheck --skippgpcheck
+          '
+          CHROOT_BUILD
+
           mkdir -p ${{ github.workspace }}/out
-          sudo cp /mnt/manjaro/tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
+          sudo cp /mnt/alarm/tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
           sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}/out/
 
       - name: 3. Збереження готового бінарника
