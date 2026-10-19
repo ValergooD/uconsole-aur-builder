@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pkg_name:
-        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, keyd)'
+        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, ffmpeg-v4l2-request-git)'
         required: true
         type: string
 
@@ -34,20 +34,16 @@ jobs:
           sudo cp -L /etc/resolv.conf /mnt/alarm/etc/resolv.conf
 
           sudo chroot /mnt/alarm /bin/bash -ex << 'CHROOT_EOF'
-          # 1. Вимикаємо CheckSpace та перевірку підписів для роботи в chroot
           sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
 
-          # 2. Оновлюємо систему та ставимо компілятори
           pacman -Syu --noconfirm --overwrite '*' ca-certificates archlinuxarm-keyring base-devel git sudo
 
-          # 3. Створюємо користувача builder і налаштовуємо sudo без вимоги TTY
           id -u builder &>/dev/null || useradd -m -G wheel builder
           echo "Defaults !requiretty" > /etc/sudoers.d/builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/builder
           chmod 0440 /etc/sudoers.d/builder
 
-          # 4. Прописуємо оптимізації під CM5 (Cortex-A76) і вимикаємо -debug пакети
           CORES=$(nproc)
           cat << MAKEPKG_EOF >> /etc/makepkg.conf
           CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"
@@ -67,20 +63,25 @@ jobs:
           mkdir -p /tmp/pkg
           chown -R builder:builder /tmp/pkg
 
-          # 1. Клонуємо репозиторій з AUR через setpriv (в обхід PAM)
           setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
 
-          # 2. Безпечно витягуємо список залежностей через .SRCINFO і ставимо їх напряму від root
           cd /tmp/pkg
-          DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | tr '\n' ' ')
-          if [ -n "\$DEPS" ]; then
-            pacman -S --needed --noconfirm \$DEPS || true
-          fi
+          # Вирізаємо застарілий OMX (OMX_Core.h) та PC-ексклюзивні бібліотеки з PKGBUILD
+          for bad_dep in libomxil-bellagio svt-av1 libvpl onevpl intel-media-sdk amf-headers ffnvcodec-headers avisynthplus; do
+            sed -i "s/'\${bad_dep}'//g; s/\"\${bad_dep}\"//g; s/ \${bad_dep} / /g; s/\${bad_dep}//g" PKGBUILD || true
+          done
+          sed -i '/--enable-omx/d; /--enable-libsvtav1/d; /--enable-libvpl/d; /--enable-amf/d; /--enable-nvenc/d; /--enable-nvdec/d; /--enable-cuvid/d; /--enable-ffnvcodec/d' PKGBUILD || true
 
-          # 3. Компілюємо пакет від імені builder
+          # Встановлюємо залежності по одній
+          DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | sort -u)
+          for dep in \$DEPS; do
+            pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep пропущено"
+          done
+
+          # Запускаємо компіляцію
           setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
             cd /tmp/pkg
-            makepkg -sA --noconfirm --nocheck --skippgpcheck
+            makepkg -dA --noconfirm --nocheck --skippgpcheck
           '
           CHROOT_BUILD
 
