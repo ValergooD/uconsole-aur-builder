@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pkg_name:
-        description: 'Назва пакета з AUR (напр. mpvpaper, ffmpeg-v4l2-request-git)'
+        description: 'Назва пакета з AUR'
         required: true
         type: string
 
@@ -18,7 +18,7 @@ jobs:
           set -euxo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y libarchive-tools curl
+          sudo apt-get install -y libarchive-tools curl git
 
           sudo mkdir -p /mnt/alarm
           curl -fL --retry 3 "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz" -o /tmp/rootfs.tar.gz
@@ -37,7 +37,7 @@ jobs:
           sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
 
-          pacman -Syu --noconfirm --overwrite '*' ca-certificates archlinuxarm-keyring base-devel git sudo
+          pacman -Syu --noconfirm --overwrite '*' ca-certificates archlinuxarm-keyring base-devel git sudo perl
 
           id -u builder &>/dev/null || useradd -m -G wheel builder
           echo "Defaults !requiretty" > /etc/sudoers.d/builder
@@ -49,42 +49,68 @@ jobs:
           CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"
           CXXFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2 -pipe -fno-plt"
           MAKEFLAGS="-j${CORES}"
-          OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !debug !lto)
+          OPTIONS=(strip !docs !libtool !staticlibs emptydirs zipman purge !debug !lto)
           MAKEPKG_EOF
           CHROOT_EOF
 
       - name: 2. Завантаження та компіляція пакета з AUR
         run: |
           set -euxo pipefail
-          PKG="${{ inputs.pkg_name }}"
 
-          sudo chroot /mnt/alarm /bin/bash -ex << CHROOT_BUILD
+          sudo chroot /mnt/alarm /usr/bin/env PKG="${{ inputs.pkg_name }}" /bin/bash -ex << 'CHROOT_BUILD'
           rm -rf /tmp/pkg
           mkdir -p /tmp/pkg
           chown -R builder:builder /tmp/pkg
 
-          setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
-
-          cd /tmp/pkg
-          # 1. Встановлюємо всі доступні в ARM64 залежності
-          DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | sort -u)
-          for dep in \$DEPS; do
-            pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep відсутній в ARM64, пропускаємо"
-          done
-
-          # 2. Спеціальна зачистка для ffmpeg: фізично прибираємо vulkan-headers, щоб autodetect не міг увімкнути vulkan_av1.c
-          if [[ "\${PKG}" == ffmpeg* ]]; then
-            pacman -Rdd --noconfirm vulkan-headers vulkan-icd-loader libplacebo shaderc || true
-            rm -rf /usr/include/vulkan /usr/include/vk_video || true
-
-            for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa vulkan libplacebo libshaderc; do
-              sed -i "s/--enable-\${flag}/--disable-\${flag}/g" PKGBUILD || true
-            done
-            sed -i 's|--prefix=/usr|--prefix=/usr --disable-vulkan --disable-libplacebo --disable-libshaderc|g' PKGBUILD || true
+          # Якщо передано ffmpeg-rpi, перемикаємо на справжнє ім'я в AUR
+          TARGET_PKG="$PKG"
+          if [[ "$PKG" == "ffmpeg-rpi" ]]; then
+            TARGET_PKG="ffmpeg-v4l2-request-git"
           fi
 
-          # 3. Запускаємо компіляцію
-          setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
+          setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${TARGET_PKG}.git" /tmp/pkg
+          cd /tmp/pkg
+
+          if [ ! -f PKGBUILD ]; then
+            echo "Помилка: PKGBUILD не знайдено для ${TARGET_PKG}"
+            exit 1
+          fi
+
+          DEPS=$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print $3}' | sed -E 's/[<>=:]+.*//' | sort -u)
+          for dep in $DEPS; do
+            pacman -S --needed --noconfirm "$dep" || true
+          done
+
+          if [[ "$TARGET_PKG" == *ffmpeg* ]]; then
+            pacman -Rdd --noconfirm vulkan-headers vulkan-icd-loader libplacebo shaderc texinfo || true
+            rm -rf /usr/include/vulkan /usr/include/vk_video || true
+
+            # Ставимо заглушки прямо в /usr/bin, щоб /bin/sh гарантовано їх бачив
+            ln -sf /usr/bin/true /usr/bin/texi2html
+            ln -sf /usr/bin/true /usr/bin/makeinfo
+
+            cat << 'DUMMY_POD' > /usr/bin/pod2man
+          #!/bin/sh
+          mkdir -p doc
+          touch doc/ffmpeg.1 doc/ffplay.1 doc/ffprobe.1 2>/dev/null || true
+          for arg in "$@"; do
+            case "$arg" in
+              *.1) mkdir -p "$(dirname "$arg")" && touch "$arg" 2>/dev/null || true ;;
+            esac
+          done
+          exit 0
+          DUMMY_POD
+            chmod +x /usr/bin/pod2man
+
+            for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa vulkan libplacebo libshaderc htmlpages manpages podpages txtpages doc; do
+              sed -i "s/--enable-${flag}//g" PKGBUILD || true
+            done
+
+            # Вимикаємо htmlpages прямо в конфігураторі, якщо є --prefix=/usr
+            sed -i 's|--prefix=/usr|--prefix=/usr --disable-htmlpages --disable-txtpages|g' PKGBUILD || true
+          fi
+
+          setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder PATH="/usr/bin:/usr/bin/core_perl:$PATH" bash -ex -c '
             cd /tmp/pkg
             makepkg -dA --noconfirm --nocheck --skippgpcheck
           '
