@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pkg_name:
-        description: 'Назва пакета з AUR (напр. mpvpaper, mpv-git, ffmpeg-v4l2-request-git)'
+        description: 'Назва пакета з AUR (напр. mpvpaper, ffmpeg-v4l2-request-git)'
         required: true
         type: string
 
@@ -66,19 +66,18 @@ jobs:
           setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
 
           cd /tmp/pkg
-          # Вирізаємо застарілий OMX (OMX_Core.h) та PC-ексклюзивні бібліотеки з PKGBUILD
-          for bad_dep in libomxil-bellagio svt-av1 libvpl onevpl intel-media-sdk amf-headers ffnvcodec-headers avisynthplus; do
-            sed -i "s/'\${bad_dep}'//g; s/\"\${bad_dep}\"//g; s/ \${bad_dep} / /g; s/\${bad_dep}//g" PKGBUILD || true
-          done
-          sed -i '/--enable-omx/d; /--enable-libsvtav1/d; /--enable-libvpl/d; /--enable-amf/d; /--enable-nvenc/d; /--enable-nvdec/d; /--enable-cuvid/d; /--enable-ffnvcodec/d' PKGBUILD || true
-
-          # Встановлюємо залежності по одній
+          # 1. Спочатку зчитуємо чистий список залежностей з оригінального .SRCINFO (поки нічого не змінено)
           DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | sort -u)
           for dep in \$DEPS; do
-            pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep пропущено"
+            pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep відсутній в ARM64, пропускаємо"
           done
 
-          # Запускаємо компіляцію
+          # 2. Прибираємо ТІЛЬКИ прапорці компіляції --enable-..., не чіпаючи масиви depends/optdepends і символи '\'
+          for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa; do
+            sed -i "s/--enable-\${flag}//g" PKGBUILD || true
+          done
+
+          # 3. Запускаємо компіляцію з -d (ігнорувати відсутні x86 пакети у списках залежностей)
           setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
             cd /tmp/pkg
             makepkg -dA --noconfirm --nocheck --skippgpcheck
