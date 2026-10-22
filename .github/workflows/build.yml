@@ -56,9 +56,8 @@ jobs:
       - name: 2. Завантаження та компіляція пакета з AUR
         run: |
           set -euxo pipefail
-          PKG="${{ inputs.pkg_name }}"
 
-          sudo chroot /mnt/alarm /bin/bash -ex << CHROOT_BUILD
+          sudo chroot /mnt/alarm /usr/bin/env PKG="${{ inputs.pkg_name }}" /bin/bash -ex << 'CHROOT_BUILD'
           rm -rf /tmp/pkg
           mkdir -p /tmp/pkg
           chown -R builder:builder /tmp/pkg
@@ -66,23 +65,19 @@ jobs:
           setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
 
           cd /tmp/pkg
-          # 1. Встановлюємо всі доступні в ARM64 залежності
-          DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | sort -u)
-          for dep in \$DEPS; do
-            pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep відсутній в ARM64, пропускаємо"
+          # 1. Встановлюємо всі доступні в ARM64 залежності з .SRCINFO
+          DEPS=$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print $3}' | sed -E 's/[<>=:]+.*//' | sort -u)
+          for dep in $DEPS; do
+            pacman -S --needed --noconfirm "$dep" || echo "Пакет $dep відсутній в ARM64, пропускаємо"
           done
 
-          # 2. Спеціальна зачистка для ffmpeg: фізично прибираємо vulkan-headers, щоб autodetect не міг увімкнути vulkan_av1.c
-          if [[ "\${PKG}" == ffmpeg* ]]; then
-            pacman -Rdd --noconfirm vulkan-headers vulkan-icd-loader libplacebo shaderc || true
-            rm -rf /usr/include/vulkan /usr/include/vk_video || true
-
-            for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa vulkan libplacebo libshaderc; do
-              sed -i "s/--enable-\${flag}/--disable-\${flag}/g" PKGBUILD || true
-            done
-            sed -i 's|--prefix=/usr|--prefix=/usr --disable-vulkan --disable-libplacebo --disable-libshaderc|g' PKGBUILD || true
+          # 2. Якщо пакет починається на ffmpeg — чистимо несумісні прапорці та видаляємо vulkan-headers
+          if [[ "${PKG}" == ffmpeg* ]]; then
+              # Avoid the Texinfo HTML-generation failure.
+              if grep -q '^\s*./configure' PKGBUILD; then
+                  sed -i '/^\s*\.\/configure/s/$/ --disable-doc/' PKGBUILD
+              fi
           fi
-
           # 3. Запускаємо компіляцію
           setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
             cd /tmp/pkg
