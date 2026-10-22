@@ -66,18 +66,19 @@ jobs:
           setpriv --reuid=builder --regid=builder --init-groups git clone "https://aur.archlinux.org/${PKG}.git" /tmp/pkg
 
           cd /tmp/pkg
-          # 1. Спочатку зчитуємо чистий список залежностей з оригінального .SRCINFO (поки нічого не змінено)
+          # 1. Зчитуємо та встановлюємо залежності з оригінального .SRCINFO
           DEPS=\$(setpriv --reuid=builder --regid=builder --init-groups makepkg --printsrcinfo | awk '/^\t(make|check)?depends = / {print \$3}' | sed -E 's/[<>=:]+.*//' | sort -u)
           for dep in \$DEPS; do
             pacman -S --needed --noconfirm "\$dep" || echo "Пакет \$dep відсутній в ARM64, пропускаємо"
           done
 
-          # 2. Прибираємо ТІЛЬКИ прапорці компіляції --enable-..., не чіпаючи масиви depends/optdepends і символи '\'
-          for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa; do
+          # 2. Прибираємо несумісні прапорці --enable-... та примусово вимикаємо зламаний vulkan_av1 у ffmpeg
+          for flag in omx libsvtav1 libvpl amf nvenc nvdec cuvid ffnvcodec avisynth ladspa vulkan libplacebo; do
             sed -i "s/--enable-\${flag}//g" PKGBUILD || true
           done
+          sed -i 's/--enable-drm/--enable-drm --disable-vulkan/g' PKGBUILD || true
 
-          # 3. Запускаємо компіляцію з -d (ігнорувати відсутні x86 пакети у списках залежностей)
+          # 3. Запускаємо компіляцію
           setpriv --reuid=builder --regid=builder --init-groups env HOME=/home/builder bash -ex -c '
             cd /tmp/pkg
             makepkg -dA --noconfirm --nocheck --skippgpcheck
