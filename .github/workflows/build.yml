@@ -85,7 +85,6 @@ jobs:
             pacman -Rdd --noconfirm vulkan-headers vulkan-icd-loader libplacebo shaderc texinfo || true
             rm -rf /usr/include/vulkan /usr/include/vk_video || true
 
-            # Ставимо заглушки прямо в /usr/bin, щоб /bin/sh гарантовано їх бачив
             ln -sf /usr/bin/true /usr/bin/texi2html
             ln -sf /usr/bin/true /usr/bin/makeinfo
 
@@ -106,7 +105,6 @@ jobs:
               sed -i "s/--enable-${flag}//g" PKGBUILD || true
             done
 
-            # Вимикаємо htmlpages прямо в конфігураторі, якщо є --prefix=/usr
             sed -i 's|--prefix=/usr|--prefix=/usr --disable-htmlpages --disable-txtpages|g' PKGBUILD || true
           fi
 
@@ -119,6 +117,11 @@ jobs:
           mkdir -p ${{ github.workspace }}/out
           sudo cp /mnt/alarm/tmp/pkg/*.pkg.tar.* ${{ github.workspace }}/out/
           sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}/out/
+
+          # Замінюємо двокрапку ':' на '-' у назвах файлів, бо GitHub Artifacts забороняє символ ':'
+          for f in ${{ github.workspace }}/out/*:*; do
+            [ -e "$f" ] && mv "$f" "${f//:/-}"
+          done
 
       - name: 3. Збереження готового бінарника
         uses: actions/upload-artifact@v4
